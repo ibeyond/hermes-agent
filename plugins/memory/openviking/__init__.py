@@ -258,6 +258,20 @@ class _VikingClient:
         return self._parse_response(resp)
 
     @retry(**_RETRY_KWARGS)
+    def delete(self, path: str, **kwargs) -> dict:
+        """Send a DELETE request to the OpenViking API."""
+        try:
+            resp = self._httpx.delete(
+                self._url(path), headers=self._headers(),
+                timeout=_TIMEOUT, **kwargs
+            )
+        except Exception as e:
+            if _is_httpx_transient(e):
+                raise OpenVikingTransientError(f"HTTP DELETE failed: {e}") from e
+            raise
+        return self._parse_response(resp)
+
+    @retry(**_RETRY_KWARGS)
     def upload_temp_file(self, file_path: Path) -> str:
         mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
         with file_path.open("rb") as f:
@@ -424,6 +438,25 @@ ADD_RESOURCE_SCHEMA = {
             },
         },
         "required": ["url"],
+    },
+}
+
+DELETE_SCHEMA = {
+    "name": "viking_delete",
+    "description": (
+        "Delete a resource or memory at a viking:// URI. "
+        "Cannot be undone. Use with caution."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "uri": {"type": "string", "description": "viking:// URI to delete."},
+            "confirm": {
+                "type": "boolean",
+                "description": "Must be True to confirm deletion (default: False).",
+            },
+        },
+        "required": ["uri", "confirm"],
     },
 }
 
@@ -611,11 +644,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         def _run():
             try:
-                client = _VikingClient(
-                    self._endpoint, self._api_key,
-                    account=self._account, user=self._user, agent=self._agent,
-                )
-                resp = client.post("/api/v1/search/find", {
+                resp = self._client.post("/api/v1/search/find", {
                     "query": query,
                     "top_k": 5,
                 })
@@ -649,19 +678,15 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         def _sync():
             try:
-                client = _VikingClient(
-                    self._endpoint, self._api_key,
-                    account=self._account, user=self._user, agent=self._agent,
-                )
                 sid = self._session_id
 
                 # Add user message
-                client.post(f"/api/v1/sessions/{sid}/messages", {
+                self._client.post(f"/api/v1/sessions/{sid}/messages", {
                     "role": "user",
                     "content": user_content[:4000],  # trim very long messages
                 })
                 # Add assistant message
-                client.post(f"/api/v1/sessions/{sid}/messages", {
+                self._client.post(f"/api/v1/sessions/{sid}/messages", {
                     "role": "assistant",
                     "content": assistant_content[:4000],
                 })
@@ -738,7 +763,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         t.start()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [SEARCH_SCHEMA, READ_SCHEMA, BROWSE_SCHEMA, REMEMBER_SCHEMA, ADD_RESOURCE_SCHEMA]
+        return [SEARCH_SCHEMA, READ_SCHEMA, BROWSE_SCHEMA, REMEMBER_SCHEMA, ADD_RESOURCE_SCHEMA, DELETE_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if not self._client:
@@ -755,6 +780,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 return self._tool_remember(args)
             elif tool_name == "viking_add_resource":
                 return self._tool_add_resource(args)
+            elif tool_name == "viking_delete":
+                return self._tool_delete(args)
             return tool_error(f"Unknown tool: {tool_name}")
         except (OpenVikingTransientError, OpenVikingPermanentError, RuntimeError) as e:
             return tool_error(str(e))
@@ -1042,6 +1069,24 @@ class OpenVikingMemoryProvider(MemoryProvider):
             "root_uri": result.get("root_uri", ""),
             "message": "Resource queued for processing. Use viking_search after a moment to find it.",
         }, ensure_ascii=False)
+
+    def _tool_delete(self, args: dict) -> str:
+        uri = args.get("uri", "")
+        if not uri:
+            return tool_error("uri is required")
+
+        confirm = args.get("confirm", False)
+        if not confirm:
+            return tool_error("confirm must be True to delete")
+
+        try:
+            self._client.delete("/api/v1/fs/delete", params={"uri": uri})
+            return json.dumps({
+                "status": "deleted",
+                "uri": uri,
+            }, ensure_ascii=False)
+        except (OpenVikingTransientError, OpenVikingPermanentError, RuntimeError) as e:
+            return tool_error(f"Delete failed: {e}")
 
 
 # ---------------------------------------------------------------------------

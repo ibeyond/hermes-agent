@@ -686,3 +686,79 @@ def test_is_available_returns_false_when_endpoint_is_empty(monkeypatch):
     monkeypatch.setenv("OPENVIKING_ENDPOINT", "")
     provider = OpenVikingMemoryProvider()
     assert provider.is_available() is False
+
+
+# ---------------------------------------------------------------------------
+# Tests for viking_delete tool
+# ---------------------------------------------------------------------------
+
+def test_tool_delete_success():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.delete.return_value = {"status": "ok"}
+
+    result = json.loads(provider._tool_delete({
+        "uri": "viking://user/test/doc.md",
+        "confirm": True,
+    }))
+
+    assert result["status"] == "deleted"
+    assert result["uri"] == "viking://user/test/doc.md"
+    provider._client.delete.assert_called_once_with(
+        "/api/v1/fs/delete", params={"uri": "viking://user/test/doc.md"}
+    )
+
+
+def test_tool_delete_empty_uri_returns_error():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+
+    result = json.loads(provider._tool_delete({
+        "uri": "",
+        "confirm": True,
+    }))
+
+    assert "error" in result
+    provider._client.delete.assert_not_called()
+
+
+def test_tool_delete_without_confirm_returns_error():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+
+    result = json.loads(provider._tool_delete({
+        "uri": "viking://user/test/doc.md",
+        "confirm": False,
+    }))
+
+    assert "error" in result
+    assert "confirm" in result["error"].lower()
+    provider._client.delete.assert_not_called()
+
+
+def test_tool_delete_network_error_returns_error():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.delete.side_effect = OpenVikingTransientError("network failure")
+
+    result = json.loads(provider._tool_delete({
+        "uri": "viking://user/test/doc.md",
+        "confirm": True,
+    }))
+
+    assert "error" in result
+    assert "delete failed" in result["error"].lower()
+
+
+def test_handle_tool_call_dispatches_to_delete():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.delete.return_value = {"status": "ok"}
+
+    result = provider.handle_tool_call("viking_delete", {
+        "uri": "viking://user/test/doc.md",
+        "confirm": True,
+    })
+    parsed = json.loads(result)
+
+    assert parsed["status"] == "deleted"
