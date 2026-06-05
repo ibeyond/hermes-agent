@@ -420,3 +420,183 @@ def test_viking_client_health_sends_auth_headers(monkeypatch):
     assert client.health() is True
     assert captured["url"] == "https://example.com/health"
     assert captured["headers"]["Authorization"] == "Bearer test-key"
+
+
+# ---------------------------------------------------------------------------
+# Tests for _tool_remember
+# ---------------------------------------------------------------------------
+
+def test_tool_remember_stores_content_with_default_category():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._user = "testuser"
+    provider._agent = "hermes"
+    provider._client.post.return_value = {
+        "result": {"written_bytes": 42}
+    }
+
+    result = json.loads(provider._tool_remember({"content": "user prefers concise responses"}))
+
+    assert result["status"] == "stored"
+    assert "42b" in result["message"]
+    provider._client.post.assert_called_once()
+    call_args = provider._client.post.call_args
+    assert call_args[0][0] == "/api/v1/content/write"
+    assert "preferences" in call_args[0][1]["uri"]
+
+
+def test_tool_remember_stores_content_with_explicit_category():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._user = "testuser"
+    provider._agent = "hermes"
+    provider._client.post.return_value = {
+        "result": {"written_bytes": 100}
+    }
+
+    result = json.loads(provider._tool_remember({
+        "content": "meeting scheduled for Monday",
+        "category": "event"
+    }))
+
+    assert result["status"] == "stored"
+    call_args = provider._client.post.call_args
+    assert "events" in call_args[0][1]["uri"]
+
+
+def test_tool_remember_rejects_empty_content():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._user = "testuser"
+    provider._agent = "hermes"
+
+    result = json.loads(provider._tool_remember({"content": ""}))
+
+    assert "error" in result
+    assert "content is required" in result["error"].lower()
+
+
+def test_tool_remember_handles_server_error():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._user = "testuser"
+    provider._agent = "hermes"
+    provider._client.post.side_effect = RuntimeError("Connection refused")
+
+    result = json.loads(provider._tool_remember({"content": "test memory"}))
+
+    assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# Tests for handle_tool_call
+# ---------------------------------------------------------------------------
+
+def test_handle_tool_call_dispatches_to_search():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.post.return_value = {
+        "result": {"memories": [], "resources": [], "skills": [], "total": 0}
+    }
+
+    result = provider.handle_tool_call("viking_search", {"query": "test"})
+    parsed = json.loads(result)
+
+    assert "results" in parsed
+
+
+def test_handle_tool_call_dispatches_to_read():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.get.return_value = {"result": {"content": "test content"}}
+
+    result = provider.handle_tool_call("viking_read", {
+        "uri": "viking://user/test",
+        "level": "overview"
+    })
+    parsed = json.loads(result)
+
+    assert parsed["content"] == "test content"
+
+
+def test_handle_tool_call_dispatches_to_browse():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.get.return_value = {"result": {"entries": []}}
+
+    result = provider.handle_tool_call("viking_browse", {
+        "action": "list",
+        "path": "viking://"
+    })
+    parsed = json.loads(result)
+
+    assert "entries" in parsed or "path" in parsed
+
+
+def test_handle_tool_call_dispatches_to_remember():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._user = "testuser"
+    provider._agent = "hermes"
+    provider._client.post.return_value = {"result": {"written_bytes": 10}}
+
+    result = provider.handle_tool_call("viking_remember", {"content": "test"})
+    parsed = json.loads(result)
+
+    assert parsed["status"] == "stored"
+
+
+def test_handle_tool_call_dispatches_to_add_resource():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.post.return_value = {"status": "ok"}
+
+    result = provider.handle_tool_call("viking_add_resource", {
+        "url": "https://example.com/doc"
+    })
+    parsed = json.loads(result)
+
+    assert "added" in parsed["status"].lower() or parsed["status"] == "ok"
+
+
+def test_handle_tool_call_unknown_tool_returns_error():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+
+    result = provider.handle_tool_call("viking_nonexistent", {})
+    parsed = json.loads(result)
+
+    assert "error" in parsed
+
+
+def test_handle_tool_call_no_client_returns_error():
+    provider = OpenVikingMemoryProvider()
+    provider._client = None
+
+    result = provider.handle_tool_call("viking_search", {"query": "test"})
+    parsed = json.loads(result)
+
+    assert "error" in parsed
+    assert "not connected" in parsed["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Tests for is_available
+# ---------------------------------------------------------------------------
+
+def test_is_available_returns_true_when_endpoint_set(monkeypatch):
+    monkeypatch.setenv("OPENVIKING_ENDPOINT", "http://localhost:1933")
+    provider = OpenVikingMemoryProvider()
+    assert provider.is_available() is True
+
+
+def test_is_available_returns_false_when_endpoint_not_set(monkeypatch):
+    monkeypatch.delenv("OPENVIKING_ENDPOINT", raising=False)
+    provider = OpenVikingMemoryProvider()
+    assert provider.is_available() is False
+
+
+def test_is_available_returns_false_when_endpoint_is_empty(monkeypatch):
+    monkeypatch.setenv("OPENVIKING_ENDPOINT", "")
+    provider = OpenVikingMemoryProvider()
+    assert provider.is_available() is False
