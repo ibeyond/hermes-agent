@@ -847,3 +847,36 @@ def test_default_timeout_when_env_not_set(monkeypatch):
     importlib.reload(ov)
     assert ov._OPENVIKING_TIMEOUT == 30.0
     importlib.reload(ov)
+
+
+def test_default_pool_limits(monkeypatch):
+    monkeypatch.delenv("OPENVIKING_MAX_CONNECTIONS", raising=False)
+    monkeypatch.delenv("OPENVIKING_MAX_KEEPALIVE", raising=False)
+    monkeypatch.delenv("OPENVIKING_KEEPALIVE_EXPIRY", raising=False)
+    import importlib
+    import plugins.memory.openviking as ov
+    importlib.reload(ov)
+    assert ov._OPENVIKING_MAX_CONNECTIONS == 100
+    assert ov._OPENVIKING_MAX_KEEPALIVE == 20
+    assert ov._OPENVIKING_KEEPALIVE_EXPIRY == 30.0
+    importlib.reload(ov)
+
+
+def test_pool_limits_from_env(monkeypatch):
+    monkeypatch.setenv("OPENVIKING_MAX_CONNECTIONS", "50")
+    monkeypatch.setenv("OPENVIKING_MAX_KEEPALIVE", "10")
+    monkeypatch.setenv("OPENVIKING_KEEPALIVE_EXPIRY", "15.0")
+    import importlib
+    import plugins.memory.openviking as ov
+    importlib.reload(ov)
+    assert ov._OPENVIKING_MAX_CONNECTIONS == 50
+    assert ov._OPENVIKING_MAX_KEEPALIVE == 10
+    assert ov._OPENVIKING_KEEPALIVE_EXPIRY == 15.0
+    importlib.reload(ov)
+
+
+def test_viking_client_uses_connection_pool():
+    client = _VikingClient("http://127.0.0.1:1933")
+    assert client._httpx is not None
+    import httpx
+    assert isinstance(client._httpx, httpx.Client)

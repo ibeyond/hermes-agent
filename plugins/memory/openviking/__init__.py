@@ -80,6 +80,9 @@ _OPENVIKING_TIMEOUT = float(os.environ.get("OPENVIKING_TIMEOUT", "30.0"))
 _OPENVIKING_RETRY_ATTEMPTS = int(os.environ.get("OPENVIKING_RETRY_ATTEMPTS", "3"))
 _OPENVIKING_RETRY_MIN_WAIT = float(os.environ.get("OPENVIKING_RETRY_MIN_WAIT", "0.5"))
 _OPENVIKING_RETRY_MAX_WAIT = float(os.environ.get("OPENVIKING_RETRY_MAX_WAIT", "10.0"))
+_OPENVIKING_MAX_CONNECTIONS = int(os.environ.get("OPENVIKING_MAX_CONNECTIONS", "100"))
+_OPENVIKING_MAX_KEEPALIVE = int(os.environ.get("OPENVIKING_MAX_KEEPALIVE", "20"))
+_OPENVIKING_KEEPALIVE_EXPIRY = float(os.environ.get("OPENVIKING_KEEPALIVE_EXPIRY", "30.0"))
 _REMOTE_RESOURCE_PREFIXES = ("http://", "https://", "git@", "ssh://", "git://")
 
 # Maps the viking_remember `category` enum to a viking:// subdirectory.
@@ -163,7 +166,7 @@ _RETRY_KWARGS = dict(
 
 
 class _VikingClient:
-    """Thin HTTP client for the OpenViking REST API."""
+    """Thin HTTP client for the OpenViking REST API with connection pooling."""
 
     def __init__(self, endpoint: str, api_key: str = "",
                  account: str = "", user: str = "", agent: str = ""):
@@ -172,9 +175,15 @@ class _VikingClient:
         self._account = account or os.environ.get("OPENVIKING_ACCOUNT", "default")
         self._user = user or os.environ.get("OPENVIKING_USER", "default")
         self._agent = agent or os.environ.get("OPENVIKING_AGENT", "hermes")
-        self._httpx = _get_httpx()
-        if self._httpx is None:
+        httpx = _get_httpx()
+        if httpx is None:
             raise ImportError("httpx is required for OpenViking: pip install httpx")
+        limits = httpx.Limits(
+            max_connections=_OPENVIKING_MAX_CONNECTIONS,
+            max_keepalive_connections=_OPENVIKING_MAX_KEEPALIVE,
+            keepalive_expiry=_OPENVIKING_KEEPALIVE_EXPIRY,
+        )
+        self._httpx = httpx.Client(limits=limits)
 
     def _headers(self) -> dict:
         h = {
