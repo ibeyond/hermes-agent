@@ -76,7 +76,10 @@ class OpenVikingPermanentError(Exception):
     pass
 
 _DEFAULT_ENDPOINT = "http://127.0.0.1:1933"
-_TIMEOUT = 30.0
+_OPENVIKING_TIMEOUT = float(os.environ.get("OPENVIKING_TIMEOUT", "30.0"))
+_OPENVIKING_RETRY_ATTEMPTS = int(os.environ.get("OPENVIKING_RETRY_ATTEMPTS", "3"))
+_OPENVIKING_RETRY_MIN_WAIT = float(os.environ.get("OPENVIKING_RETRY_MIN_WAIT", "0.5"))
+_OPENVIKING_RETRY_MAX_WAIT = float(os.environ.get("OPENVIKING_RETRY_MAX_WAIT", "10.0"))
 _REMOTE_RESOURCE_PREFIXES = ("http://", "https://", "git@", "ssh://", "git://")
 
 # Maps the viking_remember `category` enum to a viking:// subdirectory.
@@ -152,8 +155,8 @@ def _is_httpx_transient(exc) -> bool:
 # Retry decorator for transient errors (network errors, 5xx, timeouts)
 _RETRY_KWARGS = dict(
     retry=retry_if_exception_type(OpenVikingTransientError),
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=0.5, min=0.5, max=10),
+    stop=stop_after_attempt(_OPENVIKING_RETRY_ATTEMPTS),
+    wait=wait_exponential(multiplier=0.5, min=_OPENVIKING_RETRY_MIN_WAIT, max=_OPENVIKING_RETRY_MAX_WAIT),
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
@@ -236,7 +239,7 @@ class _VikingClient:
     def get(self, path: str, **kwargs) -> dict:
         try:
             resp = self._httpx.get(
-                self._url(path), headers=self._headers(), timeout=_TIMEOUT, **kwargs
+                self._url(path), headers=self._headers(), timeout=_OPENVIKING_TIMEOUT, **kwargs
             )
         except Exception as e:
             if _is_httpx_transient(e):
@@ -249,7 +252,7 @@ class _VikingClient:
         try:
             resp = self._httpx.post(
                 self._url(path), json=payload or {}, headers=self._headers(),
-                timeout=_TIMEOUT, **kwargs
+                timeout=_OPENVIKING_TIMEOUT, **kwargs
             )
         except Exception as e:
             if _is_httpx_transient(e):
@@ -263,7 +266,7 @@ class _VikingClient:
         try:
             resp = self._httpx.delete(
                 self._url(path), headers=self._headers(),
-                timeout=_TIMEOUT, **kwargs
+                timeout=_OPENVIKING_TIMEOUT, **kwargs
             )
         except Exception as e:
             if _is_httpx_transient(e):
@@ -280,7 +283,7 @@ class _VikingClient:
                     self._url("/api/v1/resources/temp_upload"),
                     files={"file": (file_path.name, f, mime_type)},
                     headers=self._multipart_headers(),
-                    timeout=_TIMEOUT,
+                    timeout=_OPENVIKING_TIMEOUT,
                 )
             except Exception as e:
                 if _is_httpx_transient(e):

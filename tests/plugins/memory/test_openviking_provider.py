@@ -762,3 +762,88 @@ def test_handle_tool_call_dispatches_to_delete():
     parsed = json.loads(result)
 
     assert parsed["status"] == "deleted"
+
+
+# ---------------------------------------------------------------------------
+# sync_turn
+# ---------------------------------------------------------------------------
+
+
+def test_sync_turn_starts_background_thread():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.post.return_value = {"status": "ok"}
+
+    initial_thread = provider._sync_thread
+    provider.sync_turn("hello", "hi there")
+
+    assert provider._sync_thread is not None
+    assert provider._sync_thread is not initial_thread
+
+
+def test_sync_turn_handles_no_client():
+    provider = OpenVikingMemoryProvider()
+    provider._client = None
+
+    provider.sync_turn("hello", "hi there")
+    assert provider._turn_count == 0
+
+
+# ---------------------------------------------------------------------------
+# prefetch
+# ---------------------------------------------------------------------------
+
+
+def test_prefetch_returns_empty_when_no_results():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._prefetch_thread = None
+    provider._prefetch_result = ""
+
+    result = provider.prefetch("test query")
+    assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# system_prompt_block
+# ---------------------------------------------------------------------------
+
+
+def test_system_prompt_block_returns_empty_when_unavailable():
+    provider = OpenVikingMemoryProvider()
+    provider._client = None
+
+    result = provider.system_prompt_block()
+    assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# environment variable configuration
+# ---------------------------------------------------------------------------
+
+
+def test_configurable_timeout_from_env(monkeypatch):
+    monkeypatch.setenv("OPENVIKING_TIMEOUT", "60.0")
+    import importlib
+    import plugins.memory.openviking as ov
+    importlib.reload(ov)
+    assert ov._OPENVIKING_TIMEOUT == 60.0
+    importlib.reload(ov)
+
+
+def test_configurable_retry_attempts_from_env(monkeypatch):
+    monkeypatch.setenv("OPENVIKING_RETRY_ATTEMPTS", "5")
+    import importlib
+    import plugins.memory.openviking as ov
+    importlib.reload(ov)
+    assert ov._OPENVIKING_RETRY_ATTEMPTS == 5
+    importlib.reload(ov)
+
+
+def test_default_timeout_when_env_not_set(monkeypatch):
+    monkeypatch.delenv("OPENVIKING_TIMEOUT", raising=False)
+    import importlib
+    import plugins.memory.openviking as ov
+    importlib.reload(ov)
+    assert ov._OPENVIKING_TIMEOUT == 30.0
+    importlib.reload(ov)
