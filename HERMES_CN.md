@@ -223,6 +223,15 @@ hermes mcp                    # MCP 服务器管理
 | 技能 | `$HERMES_HOME/skills/` |
 | 插件 | `$HERMES_HOME/plugins/` |
 
+## 环境变量
+
+| 变量 | 说明 |
+|------|------|
+| `HERMES_NO_BROWSER=1` | 禁用 OAuth 流程中的自动浏览器打开。URL 仍会打印到终端，用户可手动打开。 |
+| `HERMES_HOME` | 配置和数据存储位置 |
+| `DISPLAY` / `WAYLAND_DISPLAY` | 图形浏览器检测（Linux 系统） |
+| `BROWSER` | 指定浏览器程序 |
+
 ## 多 Profile 支持
 
 Hermes 支持多个完全隔离的实例:

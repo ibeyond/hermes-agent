@@ -2906,7 +2906,7 @@ def _spotify_interactive_setup(redirect_uri_hint: str) -> str:
     print("  5. Paste it below.")
     print()
 
-    if not _is_remote_session():
+    if not _is_remote_session() and not _get_hermes_no_browser():
         try:
             webbrowser.open(SPOTIFY_DASHBOARD_URL)
         except Exception:
@@ -2983,7 +2983,7 @@ def login_spotify_command(args) -> None:
 
     _print_loopback_ssh_hint(redirect_uri, docs_url=SPOTIFY_DOCS_URL)
 
-    if open_browser and not _is_remote_session() and _can_open_graphical_browser():
+    if open_browser and not _get_hermes_no_browser() and not _is_remote_session() and _can_open_graphical_browser():
         try:
             opened = webbrowser.open(authorize_url)
         except Exception:
@@ -3139,6 +3139,16 @@ def _can_open_graphical_browser() -> bool:
         return False
 
     return True
+
+
+def _get_hermes_no_browser() -> bool:
+    """Return True when HERMES_NO_BROWSER=1 is set.
+
+    Users can set this environment variable to disable automatic browser opening
+    in OAuth flows. The URL will still be printed to the terminal so the user
+    can manually open it if desired.
+    """
+    return os.getenv("HERMES_NO_BROWSER") == "1"
 
 
 def _parse_pasted_callback(raw: str) -> dict:
@@ -6644,7 +6654,7 @@ def _xai_oauth_loopback_login(
 
             _print_loopback_ssh_hint(redirect_uri, docs_url=XAI_OAUTH_DOCS_URL)
 
-            if open_browser and not _is_remote_session() and _can_open_graphical_browser():
+            if open_browser and not _get_hermes_no_browser() and not _is_remote_session() and _can_open_graphical_browser():
                 try:
                     opened = webbrowser.open(authorize_url)
                 except Exception:
@@ -7086,7 +7096,7 @@ def _minimax_oauth_login(
         print("To continue:")
         print(f"  1. Open: {verification_url}")
         print(f"  2. If prompted, enter code: {user_code}")
-        if open_browser and _can_open_graphical_browser():
+        if open_browser and not _get_hermes_no_browser() and _can_open_graphical_browser():
             if webbrowser.open(verification_url):
                 print("  (Opened browser for verification)")
             else:
@@ -7401,7 +7411,7 @@ def _nous_device_code_login(
         print(f"  1. Open: {verification_url}")
         print(f"  2. If prompted, enter code: {user_code}")
 
-        if open_browser:
+        if open_browser and not _get_hermes_no_browser():
             opened = webbrowser.open(verification_url)
             if opened:
                 print("  (Opened browser for verification)")
