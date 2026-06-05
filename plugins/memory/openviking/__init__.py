@@ -38,10 +38,42 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_result,
+    before_sleep_log,
+)
+
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Custom exceptions for OpenViking client
+# ---------------------------------------------------------------------------
+
+
+class OpenVikingTransientError(Exception):
+    """Raised for transient errors that should trigger retry.
+
+    Includes network errors, timeouts, and HTTP 5xx responses.
+    """
+
+    pass
+
+
+class OpenVikingPermanentError(Exception):
+    """Raised for permanent errors that should not retry.
+
+    Includes HTTP 4xx responses and API-level error responses.
+    """
+
+    pass
 
 _DEFAULT_ENDPOINT = "http://127.0.0.1:1933"
 _TIMEOUT = 30.0
@@ -104,6 +136,29 @@ def _get_httpx():
         return None
 
 
+def _is_httpx_transient(exc) -> bool:
+    """Check if an httpx exception is transient (should retry)."""
+    import httpx
+    # Network-level errors that should trigger retry
+    transient_types = (
+        httpx.ConnectError,
+        httpx.TimeoutException,
+        httpx.NetworkError,
+        httpx.RemoteProtocolError,
+    )
+    return isinstance(exc, transient_types)
+
+
+# Retry decorator for transient errors (network errors, 5xx, timeouts)
+_RETRY_KWARGS = dict(
+    retry=retry_if_exception_type(OpenVikingTransientError),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=0.5, min=0.5, max=10),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+
+
 class _VikingClient:
     """Thin HTTP client for the OpenViking REST API."""
 
@@ -119,12 +174,6 @@ class _VikingClient:
             raise ImportError("httpx is required for OpenViking: pip install httpx")
 
     def _headers(self) -> dict:
-        # Always send tenant headers when account/user are configured.
-        # OpenViking 0.3.x requires X-OpenViking-Account and X-OpenViking-User
-        # for ROOT API key requests to tenant-scoped APIs — omitting them
-        # causes INVALID_ARGUMENT errors even when account="default".
-        # User-level keys can omit them (server derives tenancy from the key),
-        # but ROOT keys must always include them explicitly.
         h = {
             "Content-Type": "application/json",
             "X-OpenViking-Agent": self._agent,
@@ -149,7 +198,7 @@ class _VikingClient:
     def _parse_response(self, resp) -> dict:
         try:
             data = resp.json()
-        except Exception:
+        except ValueError:
             data = None
 
         if resp.status_code >= 400:
@@ -158,9 +207,17 @@ class _VikingClient:
                 if isinstance(error, dict):
                     code = error.get("code", "HTTP_ERROR")
                     message = error.get("message", resp.text)
-                    raise RuntimeError(f"{code}: {message}")
-                if data.get("status") == "error":
-                    raise RuntimeError(str(data))
+                elif data.get("status") == "error":
+                    code = "OPENVIKING_ERROR"
+                    message = str(data)
+                else:
+                    code = f"HTTP_{resp.status_code}"
+                    message = resp.text
+                # 5xx errors are transient and should be retried
+                if resp.status_code >= 500:
+                    raise OpenVikingTransientError(f"{code}: {message}")
+                # 4xx errors are permanent client errors — do not retry
+                raise OpenVikingPermanentError(f"{code}: {message}")
             resp.raise_for_status()
 
         if isinstance(data, dict) and data.get("status") == "error":
@@ -168,35 +225,53 @@ class _VikingClient:
             if isinstance(error, dict):
                 code = error.get("code", "OPENVIKING_ERROR")
                 message = error.get("message", "")
-                raise RuntimeError(f"{code}: {message}")
-            raise RuntimeError(str(data))
+                raise OpenVikingPermanentError(f"{code}: {message}")
+            raise OpenVikingPermanentError(str(data))
 
         if data is None:
             return {}
         return data
 
+    @retry(**_RETRY_KWARGS)
     def get(self, path: str, **kwargs) -> dict:
-        resp = self._httpx.get(
-            self._url(path), headers=self._headers(), timeout=_TIMEOUT, **kwargs
-        )
+        try:
+            resp = self._httpx.get(
+                self._url(path), headers=self._headers(), timeout=_TIMEOUT, **kwargs
+            )
+        except Exception as e:
+            if _is_httpx_transient(e):
+                raise OpenVikingTransientError(f"HTTP GET failed: {e}") from e
+            raise
         return self._parse_response(resp)
 
+    @retry(**_RETRY_KWARGS)
     def post(self, path: str, payload: dict = None, **kwargs) -> dict:
-        resp = self._httpx.post(
-            self._url(path), json=payload or {}, headers=self._headers(),
-            timeout=_TIMEOUT, **kwargs
-        )
+        try:
+            resp = self._httpx.post(
+                self._url(path), json=payload or {}, headers=self._headers(),
+                timeout=_TIMEOUT, **kwargs
+            )
+        except Exception as e:
+            if _is_httpx_transient(e):
+                raise OpenVikingTransientError(f"HTTP POST failed: {e}") from e
+            raise
         return self._parse_response(resp)
 
+    @retry(**_RETRY_KWARGS)
     def upload_temp_file(self, file_path: Path) -> str:
         mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
         with file_path.open("rb") as f:
-            resp = self._httpx.post(
-                self._url("/api/v1/resources/temp_upload"),
-                files={"file": (file_path.name, f, mime_type)},
-                headers=self._multipart_headers(),
-                timeout=_TIMEOUT,
-            )
+            try:
+                resp = self._httpx.post(
+                    self._url("/api/v1/resources/temp_upload"),
+                    files={"file": (file_path.name, f, mime_type)},
+                    headers=self._multipart_headers(),
+                    timeout=_TIMEOUT,
+                )
+            except Exception as e:
+                if _is_httpx_transient(e):
+                    raise OpenVikingTransientError(f"Upload failed: {e}") from e
+                raise
         data = self._parse_response(resp)
         result = data.get("result", {})
         temp_file_id = result.get("temp_file_id", "")
@@ -509,7 +584,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "(abstract/overview/full), viking_browse to explore.\n"
                 "Use viking_remember to store facts, viking_add_resource to index URLs/docs."
             )
-        except Exception as e:
+        except (OpenVikingTransientError, OpenVikingPermanentError, RuntimeError) as e:
             logger.warning("OpenViking system_prompt_block failed: %s", e)
             return (
                 "# OpenViking Knowledge Base\n"
@@ -557,7 +632,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 if parts:
                     with self._prefetch_lock:
                         self._prefetch_result = "\n".join(parts)
-            except Exception as e:
+            except (OpenVikingTransientError, OpenVikingPermanentError, RuntimeError) as e:
                 logger.debug("OpenViking prefetch failed: %s", e)
 
         self._prefetch_thread = threading.Thread(
@@ -590,7 +665,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     "role": "assistant",
                     "content": assistant_content[:4000],
                 })
-            except Exception as e:
+            except (OpenVikingTransientError, OpenVikingPermanentError, RuntimeError) as e:
                 logger.debug("OpenViking sync_turn failed: %s", e)
 
         # Wait for any previous sync to finish before starting a new one
@@ -623,7 +698,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         try:
             self._client.post(f"/api/v1/sessions/{self._session_id}/commit")
             logger.info("OpenViking session %s committed (%d turns)", self._session_id, self._turn_count)
-        except Exception as e:
+        except (OpenVikingTransientError, OpenVikingPermanentError, RuntimeError) as e:
             logger.warning("OpenViking session commit failed: %s", e)
 
     def _build_memory_uri(self, subdir: str) -> str:
@@ -656,7 +731,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     "content": content,
                     "mode": "create",
                 })
-            except Exception as e:
+            except (OpenVikingTransientError, OpenVikingPermanentError, RuntimeError) as e:
                 logger.debug("OpenViking memory mirror failed: %s", e)
 
         t = threading.Thread(target=_write, daemon=True, name="openviking-memwrite")
@@ -681,7 +756,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             elif tool_name == "viking_add_resource":
                 return self._tool_add_resource(args)
             return tool_error(f"Unknown tool: {tool_name}")
-        except Exception as e:
+        except (OpenVikingTransientError, OpenVikingPermanentError, RuntimeError) as e:
             return tool_error(str(e))
 
     def shutdown(self) -> None:
@@ -722,7 +797,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         """
         try:
             resp = self._client.get("/api/v1/fs/stat", params={"uri": uri})
-        except Exception:
+        except (OpenVikingTransientError, OpenVikingPermanentError, RuntimeError):
             return None
         result = self._unwrap_result(resp)
         if isinstance(result, dict):
@@ -813,7 +888,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         try:
             resp = self._client.get(endpoint, params={"uri": resolved_uri})
-        except Exception:
+        except (OpenVikingTransientError, OpenVikingPermanentError, RuntimeError):
             # OpenViking may return HTTP 500 for abstract/overview reads on normal
             # file URIs (mem_*.md). For those, gracefully fallback to full read.
             if not summary_level or resolved_uri != uri or used_fallback:
@@ -906,7 +981,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "status": "stored",
                 "message": f"Memory stored ({written}b) and queued for vector indexing.",
             })
-        except Exception as e:
+        except (OpenVikingTransientError, OpenVikingPermanentError, RuntimeError) as e:
             logger.error("OpenViking content/write failed: %s", e)
             return tool_error(f"Failed to store memory: {e}")
 

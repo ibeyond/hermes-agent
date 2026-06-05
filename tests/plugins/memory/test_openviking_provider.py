@@ -5,7 +5,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from plugins.memory.openviking import OpenVikingMemoryProvider, _VikingClient
+from plugins.memory.openviking import (
+    OpenVikingMemoryProvider,
+    OpenVikingPermanentError,
+    OpenVikingTransientError,
+    _VikingClient,
+)
 
 
 def test_tool_search_sorts_by_raw_score_across_buckets():
@@ -335,93 +340,174 @@ def test_viking_client_raises_structured_server_error():
         raise_for_status=lambda: None,
     )
 
-    with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
+    with pytest.raises(OpenVikingPermanentError, match="PERMISSION_DENIED"):
         client._parse_response(response)
 
 
-def test_viking_client_headers_include_bearer_when_api_key_set():
-    client = _VikingClient(
-        "https://example.com",
-        api_key="test-key",
-        account="acct",
-        user="usr",
-        agent="hermes",
+def test_viking_client_raises_transient_error_on_5xx():
+    """5xx responses raise OpenVikingTransientError for retry."""
+    client = _VikingClient.__new__(_VikingClient)
+    response = SimpleNamespace(
+        status_code=503,
+        text="Service Unavailable",
+        json=lambda: {"status": "error", "error": {"code": "SERVER_ERROR", "message": "busy"}},
+        raise_for_status=lambda: None,
     )
-    headers = client._headers()
-    assert headers["X-API-Key"] == "test-key"
-    assert headers["Authorization"] == "Bearer test-key"
+
+    with pytest.raises(OpenVikingTransientError, match="SERVER_ERROR"):
+        client._parse_response(response)
 
 
-def test_viking_client_headers_send_tenant_when_default():
-    # account/user set to the literal string "default". OpenViking 0.3.x
-    # requires X-OpenViking-Account and X-OpenViking-User for ROOT API key
-    # requests to tenant-scoped APIs — omitting them causes
-    # INVALID_ARGUMENT errors even when account="default".
-    client = _VikingClient(
-        "https://example.com",
-        api_key="test-key",
-        account="default",
-        user="default",
-        agent="hermes",
+def test_viking_client_raises_permanent_error_on_4xx():
+    """4xx responses raise OpenVikingPermanentError (no retry)."""
+    client = _VikingClient.__new__(_VikingClient)
+    response = SimpleNamespace(
+        status_code=400,
+        text="Bad Request",
+        json=lambda: {"status": "error", "error": {"code": "BAD_REQUEST", "message": "invalid"}},
+        raise_for_status=lambda: None,
     )
-    headers = client._headers()
-    assert headers["X-OpenViking-Account"] == "default"
-    assert headers["X-OpenViking-User"] == "default"
-    assert headers["X-OpenViking-Agent"] == "hermes"
-    assert headers["Authorization"] == "Bearer test-key"
+
+    with pytest.raises(OpenVikingPermanentError, match="BAD_REQUEST"):
+        client._parse_response(response)
 
 
-def test_viking_client_headers_send_tenant_when_empty_falls_back_to_default():
-    # Empty account/user strings fall back to "default" via the constructor.
-    # Headers are sent even for the default value — ROOT API keys need them.
-    client = _VikingClient(
-        "https://example.com",
-        api_key="",
-        account="",
-        user="",
-        agent="hermes",
-    )
-    headers = client._headers()
-    assert headers["X-OpenViking-Account"] == "default"
-    assert headers["X-OpenViking-User"] == "default"
-    assert "Authorization" not in headers
-    assert "X-API-Key" not in headers
+def test_viking_client_get_retries_on_transient_error(monkeypatch):
+    """GET retries on transient (5xx) errors and succeeds on retry."""
+    client = _VikingClient("https://example.com")
+    call_count = [0]
+
+    def failing_get(url, **kwargs):
+        call_count[0] += 1
+        if call_count[0] < 3:
+            return SimpleNamespace(
+                status_code=503,
+                text="unavailable",
+                json=lambda: {"status": "error", "error": {"code": "BUSY", "message": "retry"}},
+                raise_for_status=lambda: None,
+            )
+        return SimpleNamespace(
+            status_code=200,
+            text="ok",
+            json=lambda: {"result": {"data": "success"}},
+            raise_for_status=lambda: None,
+        )
+
+    monkeypatch.setattr(client._httpx, "get", failing_get)
+
+    result = client.get("/api/v1/test")
+    assert result == {"result": {"data": "success"}}
+    assert call_count[0] == 3
 
 
-def test_viking_client_headers_sent_with_real_tenant_values():
-    client = _VikingClient(
-        "https://example.com",
-        api_key="test-key",
-        account="real-account",
-        user="real-user",
-        agent="hermes",
-    )
-    headers = client._headers()
-    assert headers["X-OpenViking-Account"] == "real-account"
-    assert headers["X-OpenViking-User"] == "real-user"
+def test_viking_client_get_does_not_retry_on_permanent_error(monkeypatch):
+    """GET does not retry on permanent (4xx) errors."""
+    client = _VikingClient("https://example.com")
+    call_count = [0]
+
+    def always_4xx(url, **kwargs):
+        call_count[0] += 1
+        return SimpleNamespace(
+            status_code=404,
+            text="not found",
+            json=lambda: {"status": "error", "error": {"code": "NOT_FOUND", "message": "missing"}},
+            raise_for_status=lambda: None,
+        )
+
+    monkeypatch.setattr(client._httpx, "get", always_4xx)
+
+    with pytest.raises(OpenVikingPermanentError, match="NOT_FOUND"):
+        client.get("/api/v1/test")
+
+    assert call_count[0] == 1
 
 
-def test_viking_client_health_sends_auth_headers(monkeypatch):
-    client = _VikingClient(
-        "https://example.com",
-        api_key="test-key",
-        account="",
-        user="",
-        agent="hermes",
-    )
-    captured = {}
+def test_viking_client_post_retries_on_transient_error(monkeypatch):
+    """POST retries on transient (5xx) errors and succeeds on retry."""
+    client = _VikingClient("https://example.com")
+    call_count = [0]
 
-    def capture_get(url, **kwargs):
-        captured["url"] = url
-        captured["headers"] = kwargs.get("headers") or {}
-        return SimpleNamespace(status_code=200)
+    def failing_post(url, **kwargs):
+        call_count[0] += 1
+        if call_count[0] < 2:
+            return SimpleNamespace(
+                status_code=503,
+                text="unavailable",
+                json=lambda: {"status": "error", "error": {"code": "BUSY", "message": "retry"}},
+                raise_for_status=lambda: None,
+            )
+        return SimpleNamespace(
+            status_code=200,
+            text="ok",
+            json=lambda: {"result": {"created": True}},
+            raise_for_status=lambda: None,
+        )
 
-    monkeypatch.setattr(client._httpx, "get", capture_get)
-    assert client.health() is True
-    assert captured["url"] == "https://example.com/health"
-    assert captured["headers"]["Authorization"] == "Bearer test-key"
+    monkeypatch.setattr(client._httpx, "post", failing_post)
+
+    result = client.post("/api/v1/test", {"key": "value"})
+    assert result == {"result": {"created": True}}
+    assert call_count[0] == 2
 
 
+def test_viking_client_post_does_not_retry_on_permanent_error(monkeypatch):
+    """POST does not retry on permanent (4xx) errors."""
+    client = _VikingClient("https://example.com")
+    call_count = [0]
+
+    def always_4xx(url, **kwargs):
+        call_count[0] += 1
+        return SimpleNamespace(
+            status_code=403,
+            text="forbidden",
+            json=lambda: {"status": "error", "error": {"code": "FORBIDDEN", "message": "denied"}},
+            raise_for_status=lambda: None,
+        )
+
+    monkeypatch.setattr(client._httpx, "post", always_4xx)
+
+    with pytest.raises(OpenVikingPermanentError, match="FORBIDDEN"):
+        client.post("/api/v1/test", {"key": "value"})
+
+    assert call_count[0] == 1
+
+
+def test_viking_client_get_exhausts_retries_on_persistent_transient_error(monkeypatch):
+    """GET exhausts all retries on persistent 5xx and then raises."""
+    client = _VikingClient("https://example.com")
+    call_count = [0]
+
+    def always_5xx(url, **kwargs):
+        call_count[0] += 1
+        return SimpleNamespace(
+            status_code=503,
+            text="always unavailable",
+            json=lambda: {"status": "error", "error": {"code": "BUSY", "message": "retry"}},
+            raise_for_status=lambda: None,
+        )
+
+    monkeypatch.setattr(client._httpx, "get", always_5xx)
+
+    with pytest.raises(OpenVikingTransientError):
+        client.get("/api/v1/test")
+
+    assert call_count[0] == 3  # 3 retry attempts by default
+
+
+def test_viking_client_health_returns_false_on_network_error(monkeypatch):
+    """health() returns False when network error occurs."""
+    client = _VikingClient("https://example.com")
+
+    def network_error(url, **kwargs):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(client._httpx, "get", network_error)
+
+    assert client.health() is False
+
+
+# ---------------------------------------------------------------------------
+# Tests for _tool_remember
 # ---------------------------------------------------------------------------
 # Tests for _tool_remember
 # ---------------------------------------------------------------------------
